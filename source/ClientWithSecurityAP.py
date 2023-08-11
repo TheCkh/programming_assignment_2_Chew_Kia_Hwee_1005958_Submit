@@ -46,6 +46,21 @@ def convert_bytes_to_int(xbytes):
     """
     return int.from_bytes(xbytes, "big")
 
+def read_bytes(socket, length):
+    """
+    Reads the specified length of bytes from the given socket and returns a bytestring
+    """
+    buffer = []
+    bytes_received = 0
+    while bytes_received < length:
+        data = socket.recv(min(length - bytes_received, 1024))
+        if not data:
+            raise Exception("Socket connection broken")
+        buffer.append(data)
+        bytes_received += len(data)
+
+    return b"".join(buffer)
+
 
 def main(args):
     port = int(args[0]) if len(args) > 0 else 4321
@@ -60,6 +75,46 @@ def main(args):
         s.connect((server_address, port))
         print("Connected")
 
+        s.sendall(convert_int_to_bytes(3)) #Begin authentication protocol
+        a_message = "This is a dummy auth message"
+        a_message_bytes = bytes(a_message)
+        s.sendall(convert_int_to_bytes(len(a_message_bytes)))
+        s.sendall(a_message)
+
+        signed_message_len = convert_bytes_to_int(read_bytes(s, 8))
+        signed_message = read_bytes(s, signed_message_len)
+        server_len = convert_bytes_to_int(read_bytes(s, 8))
+        server = read_bytes(s, server_len)
+        
+        server_cert = x509.load_pem_x509_certificate(
+            data=server, backend=default_backend()
+        )
+
+        try: ca_public_key.verify(
+            signature=server_cert.signature, 
+            data=server_cert.tbs_certificate_bytes, 
+            padding=padding.PKCS1v15(),
+            algorithm=server_cert.signature_hash_algorithm,
+        )
+        except InvalidSignature:
+            print("AUTH failure. Connection closing")
+            s.sendall(convert_int_to_bytes(2)) #Sends Mode 2 if failed
+
+        server_public_key = server_cert.public_key()
+
+        try: server_public_key.verify(
+            signed_message, a_message_bytes, padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ), hashes.SHA256(),
+        )
+        
+        except InvalidSignature:
+            print("AUTH failure. Connection closing")
+            s.sendall(convert_int_to_bytes(2)) #Sends Mode 2 if failed
+
+        assert server_cert.not_valid_before <= datetime.utcnow() <= server_cert.not_valid_after
+
         while True:
             filename = input(
                 "Enter a filename to send (enter -1 to exit):"
@@ -69,13 +124,13 @@ def main(args):
                 filename = input("Invalid filename. Please try again:").strip()
 
             if filename == "-1":
-                s.sendall(convert_int_to_bytes(2)) #Mode 2: Closes connection
+                s.sendall(convert_int_to_bytes(2))
                 break
 
             filename_bytes = bytes(filename, encoding="utf8")
 
             # Send the filename
-            s.sendall(convert_int_to_bytes(0)) # Mode 0 is sent
+            s.sendall(convert_int_to_bytes(0))
             s.sendall(convert_int_to_bytes(len(filename_bytes)))
             s.sendall(filename_bytes)
 
